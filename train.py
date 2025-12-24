@@ -77,6 +77,16 @@ def create_training_options():
     parser.add_argument("--lr-step",        type=int,   default=1000,        help="learning rate decay step size")
     parser.add_argument("--l2-norm",        type=float, default=0.0)
     parser.add_argument("--ema",            type=float, default=0.99)
+    parser.add_argument("--distill",        action="store_true",             help="enable teacher-student distillation")
+    parser.add_argument("--teacher-ckpt",   type=str,   default=None,        help="teacher checkpoint name for distillation")
+    parser.add_argument("--no-student-pretrained", action="store_false", dest="student_pretrained", default=True,
+                        help="disable pretrained ADM initialization for student")
+    parser.add_argument("--kd-target",      type=str,   default="pred", choices=["pred", "x_prev"],
+                        help="teacher target for KD: predicted noise or one-step x_{t-1}")
+    parser.add_argument("--kd-loss",        type=str,   default="l2", choices=["l1", "l2"], help="KD loss type")
+    parser.add_argument("--kd-weight",      type=float, default=1.0,         help="weight for KD loss")
+    parser.add_argument("--gt-weight",      type=float, default=0.0,         help="weight for GT supervision loss")
+    parser.add_argument("--use-student",    action="store_true",             help="use student for sampling/evaluation")
 
     # --------------- path and logging ---------------
     parser.add_argument("--dataset-dir",    type=Path,  default="/dataset",  help="path to LMDB dataset")
@@ -109,6 +119,13 @@ def create_training_options():
         opt.load = ckpt_file
     else:
         opt.load = None
+
+    if opt.teacher_ckpt is not None:
+        teacher_ckpt_file = RESULT_DIR / opt.teacher_ckpt / "latest.pt"
+        assert teacher_ckpt_file.exists()
+        opt.teacher_load = teacher_ckpt_file
+    else:
+        opt.teacher_load = None
 
     # ========= auto assert =========
     assert opt.batch_size % opt.microbatch == 0, f"{opt.batch_size=} is not dividable by {opt.microbatch}!"

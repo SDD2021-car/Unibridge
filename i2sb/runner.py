@@ -8,6 +8,7 @@
 import os
 import numpy as np
 import pickle
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -23,7 +24,7 @@ from evaluation import build_resnet50
 
 from . import util
 from .network import Image256Net
-from .diffusion import Diffusion
+from .diffusion import Diffusion, compute_gaussian_product_coef
 
 from ipdb import set_trace as debug
 
@@ -86,16 +87,62 @@ class Runner(object):
         noise_levels = torch.linspace(opt.t0, opt.T, opt.interval, device=opt.device) * opt.interval
         self.net = Image256Net(log, noise_levels=noise_levels, use_fp16=opt.use_fp16, cond=opt.cond_x1)
         self.ema = ExponentialMovingAverage(self.net.parameters(), decay=opt.ema)
+        self.student = None
+        self.student_ema = None
 
+        checkpoint = None
         if opt.load:
             checkpoint = torch.load(opt.load, map_location="cpu")
-            self.net.load_state_dict(checkpoint['net'])
-            log.info(f"[Net] Loaded network ckpt: {opt.load}!")
-            self.ema.load_state_dict(checkpoint["ema"])
-            log.info(f"[Ema] Loaded ema ckpt: {opt.load}!")
+
+        if opt.teacher_load:
+            teacher_ckpt = torch.load(opt.teacher_load, map_location="cpu")
+            self.net.load_state_dict(teacher_ckpt["net"])
+            log.info(f"[Net] Loaded teacher ckpt: {opt.teacher_load}!")
+            if "ema" in teacher_ckpt and teacher_ckpt["ema"] is not None:
+                self.ema.load_state_dict(teacher_ckpt["ema"])
+                log.info(f"[Ema] Loaded teacher ema ckpt: {opt.teacher_load}!")
+            else:
+                log.warning(f"[Ema] Teacher ckpt {opt.teacher_load} has no ema!")
+        elif checkpoint is not None:
+            if "net" in checkpoint:
+                self.net.load_state_dict(checkpoint["net"])
+                log.info(f"[Net] Loaded network ckpt: {opt.load}!")
+            else:
+                log.warning(f"[Net] Ckpt {opt.load} has no net!")
+            if "ema" in checkpoint and checkpoint["ema"] is not None:
+                self.ema.load_state_dict(checkpoint["ema"])
+                log.info(f"[Ema] Loaded ema ckpt: {opt.load}!")
+            else:
+                log.warning(f"[Ema] Ckpt {opt.load} has no ema!")
+
+        if opt.distill:
+            for p in self.net.parameters():
+                p.requires_grad_(False)
+            self.net.eval()
+            self.student = Image256Net(
+                log,
+                noise_levels=noise_levels,
+                use_fp16=opt.use_fp16,
+                cond=opt.cond_x1,
+                pretrained_adm=opt.student_pretrained,
+            )
+            self.student_ema = ExponentialMovingAverage(self.student.parameters(), decay=opt.ema)
+            if checkpoint is not None and "student" in checkpoint:
+                self.student.load_state_dict(checkpoint["student"])
+                log.info(f"[Student] Loaded student ckpt: {opt.load}!")
+                if "student_ema" in checkpoint and checkpoint["student_ema"] is not None:
+                    self.student_ema.load_state_dict(checkpoint["student_ema"])
+                    log.info(f"[Student] Loaded student ema ckpt: {opt.load}!")
+                else:
+                    log.warning(f"[Student] Ckpt {opt.load} has no student ema!")
+            elif checkpoint is not None:
+                log.warning(f"[Student] Ckpt {opt.load} has no student; initializing student from scratch.")
 
         self.net.to(opt.device)
         self.ema.to(opt.device)
+        if self.student is not None:
+            self.student.to(opt.device)
+            self.student_ema.to(opt.device)
 
         self.log = log
 
@@ -111,6 +158,34 @@ class Runner(object):
         pred_x0 = xt - std_fwd * net_out
         if clip_denoise: pred_x0.clamp_(-1., 1.)
         return pred_x0
+
+    def compute_prev_xt(self, step, xt, net_out, ot_ode=False):
+        """ Compute x_{t-1} from x_t and predicted noise. """
+        pred_x0 = self.compute_pred_x0(step, xt, net_out)
+        nprev = torch.clamp(step - 1, min=0)
+
+        std_n = self.diffusion.std_fwd[step]
+        std_nprev = self.diffusion.std_fwd[nprev]
+        std_delta = (std_n**2 - std_nprev**2).sqrt()
+
+        mu_x0, mu_xn, var = compute_gaussian_product_coef(std_nprev, std_delta)
+        mu_x0 = util.unsqueeze_xdim(mu_x0, xt.shape[1:])
+        mu_xn = util.unsqueeze_xdim(mu_xn, xt.shape[1:])
+        var = util.unsqueeze_xdim(var, xt.shape[1:])
+
+        xt_prev = mu_x0 * pred_x0 + mu_xn * xt
+        if not ot_ode:
+            noise = torch.randn_like(xt_prev)
+            add_mask = util.unsqueeze_xdim((nprev > 0).float(), xt.shape[1:])
+            xt_prev = xt_prev + add_mask * var.sqrt() * noise
+        return xt_prev
+
+    def select_infer_modules(self, opt, use_student=None):
+        if use_student is None:
+            use_student = getattr(opt, "use_student", False)
+        if use_student and self.student is not None:
+            return self.student, self.student_ema, "student"
+        return self.net, self.ema, "teacher"
 
     def sample_batch(self, opt, loader, corrupt_method):
         if opt.corrupt == "mixture":
@@ -150,8 +225,13 @@ class Runner(object):
         self.writer = util.build_log_writer(opt)
         log = self.log
 
-        net = DDP(self.net, device_ids=[opt.device])
-        ema = self.ema
+        if opt.distill:
+            net = DDP(self.student, device_ids=[opt.device])
+            ema = self.student_ema
+            log.info(f"[Distill] Enabled KD: {opt.kd_target=}, {opt.kd_loss=}, {opt.kd_weight=}, {opt.gt_weight=}.")
+        else:
+            net = DDP(self.net, device_ids=[opt.device])
+            ema = self.ema
         optimizer, sched = build_optimizer_sched(opt, net, log)
 
         train_loader = util.setup_loader(train_dataset, opt.microbatch)
@@ -160,6 +240,10 @@ class Runner(object):
         self.accuracy = torchmetrics.Accuracy().to(opt.device)
         self.resnet = build_resnet50().to(opt.device)
 
+        if opt.distill:
+            log.info("[Stage] Start training student Image256Net (teacher frozen).")
+        else:
+            log.info("[Stage] Start training Image256Net.")
         net.train()
         n_inner_loop = opt.batch_size // (opt.global_size * opt.microbatch)
         for it in range(opt.num_itr):
@@ -175,35 +259,86 @@ class Runner(object):
                 xt = self.diffusion.q_sample(step, x0, x1, ot_ode=opt.ot_ode)
                 label = self.compute_label(step, x0, xt)
 
-                pred = net(xt, step, cond=cond)
-                assert xt.shape == label.shape == pred.shape
+                kd_loss = None
+                gt_loss = None
 
-                if mask is not None:
-                    pred = mask * pred
-                    label = mask * label
+                if opt.distill:
+                    with torch.no_grad():
+                        teacher_pred = self.net(xt, step, cond=cond)
+                    student_pred = net(xt, step, cond=cond)
+                    assert xt.shape == label.shape == student_pred.shape == teacher_pred.shape
 
-                loss = F.mse_loss(pred, label)
+                    if mask is not None:
+                        teacher_pred = mask * teacher_pred
+                        student_pred = mask * student_pred
+                        label = mask * label
+
+                    if opt.kd_target == "x_prev":
+                        teacher_target = self.compute_prev_xt(step, xt, teacher_pred, ot_ode=opt.ot_ode)
+                        student_target = self.compute_prev_xt(step, xt, student_pred, ot_ode=opt.ot_ode)
+                    else:
+                        teacher_target = teacher_pred
+                        student_target = student_pred
+
+                    if opt.kd_loss == "l1":
+                        kd_loss = F.l1_loss(student_target, teacher_target)
+                    else:
+                        kd_loss = F.mse_loss(student_target, teacher_target)
+
+                    if opt.gt_weight > 0:
+                        gt_loss = F.mse_loss(student_pred, label)
+                        loss = opt.kd_weight * kd_loss + opt.gt_weight * gt_loss
+                    else:
+                        loss = opt.kd_weight * kd_loss
+                else:
+                    pred = net(xt, step, cond=cond)
+                    assert xt.shape == label.shape == pred.shape
+
+                    if mask is not None:
+                        pred = mask * pred
+                        label = mask * label
+
+                    loss = F.mse_loss(pred, label)
+
                 loss.backward()
 
             optimizer.step()
-            ema.update()
+            if ema is not None:
+                ema.update()
             if sched is not None: sched.step()
 
             # -------- logging --------
-            log.info("train_it {}/{} | lr:{} | loss:{}".format(
-                1+it,
-                opt.num_itr,
-                "{:.2e}".format(optimizer.param_groups[0]['lr']),
-                "{:+.4f}".format(loss.item()),
-            ))
+            if opt.distill:
+                log.info("train_it {}/{} | lr:{} | loss:{} | kd:{} | gt:{}".format(
+                    1+it,
+                    opt.num_itr,
+                    "{:.2e}".format(optimizer.param_groups[0]['lr']),
+                    "{:+.4f}".format(loss.item()),
+                    "{:+.4f}".format(kd_loss.item() if kd_loss is not None else 0.0),
+                    "{:+.4f}".format(gt_loss.item() if gt_loss is not None else 0.0),
+                ))
+            else:
+                log.info("train_it {}/{} | lr:{} | loss:{}".format(
+                    1+it,
+                    opt.num_itr,
+                    "{:.2e}".format(optimizer.param_groups[0]['lr']),
+                    "{:+.4f}".format(loss.item()),
+                ))
             if it % 10 == 0:
                 self.writer.add_scalar(it, 'loss', loss.detach())
+                if opt.distill:
+                    if kd_loss is not None:
+                        self.writer.add_scalar(it, 'loss/kd', kd_loss.detach())
+                    if gt_loss is not None:
+                        self.writer.add_scalar(it, 'loss/gt', gt_loss.detach())
 
             if it % 5000 == 0:
                 if opt.global_rank == 0:
                     torch.save({
                         "net": self.net.state_dict(),
-                        "ema": ema.state_dict(),
+                        "ema": self.ema.state_dict() if self.ema is not None else None,
+                        "student": self.student.state_dict() if self.student is not None else None,
+                        "student_ema": self.student_ema.state_dict() if self.student_ema is not None else None,
                         "optimizer": optimizer.state_dict(),
                         "sched": sched.state_dict() if sched is not None else sched,
                     }, opt.ckpt_path / "latest.pt")
@@ -212,13 +347,15 @@ class Runner(object):
                     torch.distributed.barrier()
 
             if it == 500 or it % 3000 == 0: # 0, 0.5k, 3k, 6k 9k
+                log.info(f"[Stage] Evaluation start (it={it}).")
                 net.eval()
                 self.evaluation(opt, it, val_loader, corrupt_method)
                 net.train()
+                log.info(f"[Stage] Evaluation end (it={it}).")
         self.writer.close()
 
     @torch.no_grad()
-    def ddpm_sampling(self, opt, x1, mask=None, cond=None, clip_denoise=False, nfe=None, log_count=10, verbose=True):
+    def ddpm_sampling(self, opt, x1, mask=None, cond=None, clip_denoise=False, nfe=None, log_count=10, verbose=True, use_student=None):
 
         # create discrete time steps that split [0, INTERVAL] into NFE sub-intervals.
         # e.g., if NFE=2 & INTERVAL=1000, then STEPS=[0, 500, 999] and 2 network
@@ -239,12 +376,18 @@ class Runner(object):
             mask = mask.to(opt.device)
             x1 = (1. - mask) * x1 + mask * torch.randn_like(x1)
 
-        with self.ema.average_parameters():
-            self.net.eval()
+        net, ema, _ = self.select_infer_modules(opt, use_student=use_student)
+        if ema is not None:
+            ema_context = ema.average_parameters()
+        else:
+            ema_context = nullcontext()
+
+        with ema_context:
+            net.eval()
 
             def pred_x0_fn(xt, step):
                 step = torch.full((xt.shape[0],), step, device=opt.device, dtype=torch.long)
-                out = self.net(xt, step, cond=cond)
+                out = net(xt, step, cond=cond)
                 return self.compute_pred_x0(step, xt, out, clip_denoise=clip_denoise)
 
             xs, pred_x0 = self.diffusion.ddpm_sampling(
@@ -260,7 +403,9 @@ class Runner(object):
     def evaluation(self, opt, it, val_loader, corrupt_method):
 
         log = self.log
+        _, _, net_name = self.select_infer_modules(opt)
         log.info(f"========== Evaluation started: iter={it} ==========")
+        log.info(f"[Eval] Using {net_name} network.")
 
         img_clean, img_corrupt, mask, y, cond = self.sample_batch(opt, val_loader, corrupt_method)
 
